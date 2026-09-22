@@ -1,10 +1,14 @@
-import hashlib
 import shutil
 from pathlib import Path
 
 from CTFd.models import ChallengeFiles, Files, PageFiles, SolutionFiles, db
 from CTFd.utils import get_app_config
-from CTFd.utils.uploads.uploaders import FilesystemUploader, S3Uploader
+from CTFd.utils.uploads.uploaders import (
+    FilesystemUploader,
+    S3Uploader,
+    UploadIntegrityError,
+)
+from CTFd.utils.uploads.validators import hash_stream, validate_file
 
 UPLOADERS = {"filesystem": FilesystemUploader, "s3": S3Uploader}
 
@@ -30,10 +34,21 @@ def upload_file(*args, **kwargs):
             raise ValueError(
                 "Location must contain two parts, a directory and a filename"
             )
+        # Reject traversal attempts in either component
+        if ".." in path.parts or any(
+            part.startswith("/") or part.startswith("\\") for part in path.parts
+        ):
+            raise ValueError("Location must not contain path traversal sequences")
         # Allow location to override the directory and filename
         parent = path.parts[0]
         filename = path.parts[1]
         location = parent + "/" + filename
+
+    # Type whitelist + magic byte validation happens before anything is
+    # stored. Renaming a malicious script to an allowed extension cannot pass
+    # this check because the actual content is inspected as well.
+    allowed_extensions = kwargs.get("allowed_extensions")
+    validate_file(file_obj, filename, allowed_extensions=allowed_extensions)
 
     model_args = {"type": file_type, "location": location}
 
@@ -54,6 +69,16 @@ def upload_file(*args, **kwargs):
     uploader = get_uploader()
     location = uploader.upload(file_obj=file_obj, filename=filename, path=parent)
 
+    # Read the bytes back from the actual storage backend and compare
+    # digests so that bit flips or truncation during transfer are detected.
+    try:
+        uploader.verify(location, expected_hash=sha1sum)
+    except UploadIntegrityError:
+        # Do not leave a corrupt object behind and never record a row that
+        # claims a checksum the remote file does not have.
+        uploader.delete(location)
+        raise
+
     model_args["location"] = location
     model_args["sha1sum"] = sha1sum
 
@@ -71,23 +96,18 @@ def upload_file(*args, **kwargs):
 
 
 def hash_file(fp, algo="sha1"):
-    fp.seek(0)
-    if algo == "sha1":
-        h = hashlib.sha1()  # nosec
-        # https://stackoverflow.com/a/64730457
-        while chunk := fp.read(1024):
-            h.update(chunk)
-        fp.seek(0)
-        return h.hexdigest()
-    else:
-        raise NotImplementedError
+    return hash_stream(fp, algo=algo)
 
 
 def delete_file(file_id):
     f = Files.query.filter_by(id=file_id).first_or_404()
 
     uploader = get_uploader()
-    uploader.delete(filename=f.location)
+    deleted = uploader.delete(filename=f.location)
+    if deleted is False:
+        # The backing file was already gone or the location was unsafe; do
+        # not silently report success to callers that check the result.
+        return False
 
     db.session.delete(f)
     db.session.commit()

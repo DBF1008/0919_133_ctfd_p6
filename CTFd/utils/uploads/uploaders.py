@@ -1,10 +1,11 @@
 import datetime
+import hashlib
 import os
 import posixpath
 import string
 import time
 from pathlib import Path, PurePath
-from shutil import copyfileobj, rmtree
+from shutil import copyfileobj
 from urllib.parse import urlparse
 
 import boto3
@@ -15,6 +16,18 @@ from werkzeug.utils import safe_join, secure_filename
 
 from CTFd.utils import get_app_config
 from CTFd.utils.encoding import hexencode
+from CTFd.utils.uploads.validators import (
+    UploadValidationError,
+    hash_stream,
+    validate_file,
+)
+
+
+class UploadIntegrityError(Exception):
+    """
+    Raised when a file read back from the storage backend does not match the
+    hash computed before upload (bit flips / truncation during transfer).
+    """
 
 
 class BaseUploader(object):
@@ -48,6 +61,14 @@ class BaseUploader(object):
         """
         raise NotImplementedError
 
+    def verify(self, filename, expected_hash, algo="sha1"):
+        """
+        Read the stored file back and verify that its digest matches
+        `expected_hash`. Returns True on match, otherwise raises
+        UploadIntegrityError.
+        """
+        raise NotImplementedError
+
     def sync(self):
         """
         Download all remotely hosted files for the purpose of exporting
@@ -68,6 +89,34 @@ class FilesystemUploader(BaseUploader):
         super(BaseUploader, self).__init__()
         self.base_path = base_path or current_app.config.get("UPLOAD_FOLDER")
 
+    def _resolve_safe_path(self, filename):
+        """
+        Resolve `filename` inside the upload base directory, rejecting any
+        traversal attempts (absolute paths, "..", embedded NUL bytes).
+        Returns the absolute filesystem path or None if it is unsafe.
+        """
+        if not filename or "\x00" in filename:
+            return None
+        # Reject any empty ("a//b") or ".." path components before
+        # normalization, since normalization would otherwise hide them.
+        raw_parts = filename.replace("\\", "/").split("/")
+        if any(part in ("", "..") for part in raw_parts):
+            return None
+        # PurePath splits a normalized relative path into safe components.
+        parts = PurePath(posixpath.normpath(filename)).parts
+        if not parts or parts[0] == "/" or ".." in parts:
+            return None
+        path = safe_join(self.base_path, *parts)
+        if path is None:
+            return None
+        base = Path(self.base_path).resolve()
+        resolved = Path(path).resolve()
+        try:
+            resolved.relative_to(base)
+        except ValueError:
+            return None
+        return resolved
+
     def store(self, fileobj, filename):
         location = os.path.join(self.base_path, filename)
         directory = os.path.dirname(location)
@@ -84,6 +133,10 @@ class FilesystemUploader(BaseUploader):
         if len(filename) == 0:
             raise Exception("Empty filenames cannot be used")
 
+        # Content-based validation: the stream's magic bytes must agree with
+        # the claimed extension so renaming a script cannot bypass the check.
+        validate_file(file_obj, filename)
+
         # Sanitize directory name
         if path:
             path = secure_filename(path) or hexencode(os.urandom(16))
@@ -93,6 +146,8 @@ class FilesystemUploader(BaseUploader):
 
         # Sanitize file name
         filename = secure_filename(filename)
+        if not filename:
+            raise UploadValidationError("Filename was reduced to empty by sanitization")
         file_path = posixpath.join(path, filename)
 
         return self.store(file_obj, file_path)
@@ -101,17 +156,51 @@ class FilesystemUploader(BaseUploader):
         return send_file(safe_join(self.base_path, filename), as_attachment=True)
 
     def delete(self, filename):
-        if os.path.exists(os.path.join(self.base_path, filename)):
-            file_path = PurePath(filename).parts[0]
-            rmtree(os.path.join(self.base_path, file_path))
-            return True
-        return False
+        file_path = self._resolve_safe_path(filename)
+        if file_path is None or not file_path.exists():
+            return False
+        if not file_path.is_file():
+            # Never rmtree an unexpected target.
+            return False
+
+        file_path.unlink()
+
+        # Only the single random per-upload parent directory is removed, and
+        # only when it is a direct, empty child of the upload base directory.
+        base = Path(self.base_path).resolve()
+        parent = file_path.parent.resolve()
+        if parent != base and parent.parent == base:
+            try:
+                parent.rmdir()
+            except OSError:
+                # Directory is not empty (or otherwise cannot be removed):
+                # leave it in place.
+                pass
+        return True
+
+    def verify(self, filename, expected_hash, algo="sha1"):
+        file_path = self._resolve_safe_path(filename)
+        if file_path is None or not file_path.is_file():
+            raise UploadIntegrityError(
+                "Uploaded file {} is missing after upload".format(filename)
+            )
+        with file_path.open("rb") as fp:
+            actual_hash = hash_stream(fp, algo=algo)
+        if actual_hash != expected_hash:
+            raise UploadIntegrityError(
+                "Checksum mismatch for {}: expected {}, got {}".format(
+                    filename, expected_hash, actual_hash
+                )
+            )
+        return True
 
     def sync(self):
         pass
 
     def open(self, filename, mode="rb"):
-        path = Path(safe_join(self.base_path, filename))
+        path = self._resolve_safe_path(filename)
+        if path is None:
+            raise UploadValidationError("Invalid file path: {}".format(filename))
         return path.open(mode=mode)
 
 
@@ -148,6 +237,25 @@ class S3Uploader(BaseUploader):
         if c in string.ascii_letters + string.digits + "-" + "_" + ".":
             return True
 
+    def _resolve_safe_key(self, filename):
+        """
+        Validate a relative S3 object key. Rejects absolute keys, ".."
+        segments and empty path components so a stored location can never be
+        turned into an object outside of the intended prefix.
+        Returns (key_without_prefix, key_with_prefix) or None when unsafe.
+        """
+        if not filename or "\x00" in filename:
+            return None
+        if filename.startswith("/"):
+            return None
+        parts = filename.split("/")
+        if ".." in parts or any(part == "" for part in parts):
+            return None
+        normalized = posixpath.normpath(filename)
+        key = normalized
+        prefixed = (self.s3_prefix or "") + key
+        return key, prefixed
+
     def store(self, fileobj, filename):
         if self.s3_prefix:
             filename = self.s3_prefix + filename
@@ -155,6 +263,12 @@ class S3Uploader(BaseUploader):
         return filename
 
     def upload(self, file_obj, filename, path=None):
+        if len(filename) <= 0:
+            return False
+
+        # Content-based validation before any bytes leave the process.
+        validate_file(file_obj, filename)
+
         # Sanitize directory name
         if path:
             path = secure_filename(path) or hexencode(os.urandom(16))
@@ -210,9 +324,37 @@ class S3Uploader(BaseUploader):
         return redirect(url)
 
     def delete(self, filename):
-        if self.s3_prefix:
-            filename = self.s3_prefix + filename
-        self.s3.delete_object(Bucket=self.bucket, Key=filename)
+        resolved = self._resolve_safe_key(filename)
+        if resolved is None:
+            return False
+        _, key = resolved
+        self.s3.delete_object(Bucket=self.bucket, Key=key)
+        return True
+
+    def verify(self, filename, expected_hash, algo="sha1"):
+        resolved = self._resolve_safe_key(filename)
+        if resolved is None:
+            raise UploadIntegrityError("Invalid object key: {}".format(filename))
+        _, key = resolved
+        try:
+            response = self.s3.get_object(Bucket=self.bucket, Key=key)
+        except Exception as e:
+            raise UploadIntegrityError(
+                "Uploaded object {} is missing after upload: {}".format(filename, e)
+            )
+        try:
+            h = hashlib.new(algo)
+            for chunk in response["Body"].iter_chunks(1024 * 1024):
+                h.update(chunk)
+        finally:
+            response["Body"].close()
+        actual_hash = h.hexdigest()
+        if actual_hash != expected_hash:
+            raise UploadIntegrityError(
+                "Checksum mismatch for {}: expected {}, got {}".format(
+                    filename, expected_hash, actual_hash
+                )
+            )
         return True
 
     def sync(self):

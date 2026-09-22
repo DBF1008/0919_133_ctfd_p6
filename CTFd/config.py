@@ -222,6 +222,10 @@ class ServerConfig(object):
     UPLOAD_FOLDER: str = empty_str_cast(config_ini["uploads"]["UPLOAD_FOLDER"]) \
         or os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
 
+    # Comma separated whitelist of upload extensions (e.g. "zip,txt,png").
+    # Empty means the built-in default whitelist; "*" allows every extension.
+    UPLOAD_ALLOWED_EXTENSIONS: str = empty_str_cast(config_ini["uploads"].get("UPLOAD_ALLOWED_EXTENSIONS", ""))
+
     if UPLOAD_PROVIDER == "s3":
         AWS_ACCESS_KEY_ID: str = empty_str_cast(config_ini["uploads"]["AWS_ACCESS_KEY_ID"])
 

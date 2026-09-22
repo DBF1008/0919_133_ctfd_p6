@@ -10,6 +10,8 @@ from CTFd.constants import RawEnum
 from CTFd.models import Files, db
 from CTFd.schemas.files import FileSchema
 from CTFd.utils import uploads
+from CTFd.utils.uploads.uploaders import UploadIntegrityError
+from CTFd.utils.uploads.validators import UploadValidationError
 from CTFd.utils.decorators import admins_only
 from CTFd.utils.helpers.models import build_model_filters
 
@@ -130,6 +132,11 @@ class FilesList(Resource):
                 return {
                     "success": False,
                     "errors": {"location": [str(e)]},
+                }, 400
+            except (UploadValidationError, UploadIntegrityError) as e:
+                return {
+                    "success": False,
+                    "errors": {"file": [str(e)]},
                 }, 400
             objs.append(obj)
 
