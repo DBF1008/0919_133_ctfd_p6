@@ -4,7 +4,7 @@ import posixpath
 import string
 import time
 from pathlib import Path, PurePath
-from shutil import copyfileobj, rmtree
+from shutil import copyfileobj
 from urllib.parse import urlparse
 
 import boto3
@@ -101,9 +101,30 @@ class FilesystemUploader(BaseUploader):
         return send_file(safe_join(self.base_path, filename), as_attachment=True)
 
     def delete(self, filename):
-        if os.path.exists(os.path.join(self.base_path, filename)):
-            file_path = PurePath(filename).parts[0]
-            rmtree(os.path.join(self.base_path, file_path))
+        # Reject absolute paths and path traversal attempts
+        pure_path = PurePath(filename)
+        if pure_path.is_absolute() or ".." in pure_path.parts:
+            raise ValueError("Invalid file path")
+
+        base_path = os.path.realpath(self.base_path)
+        file_path = os.path.realpath(os.path.join(base_path, *pure_path.parts))
+
+        # Ensure the resolved path stays inside the upload folder
+        if os.path.commonpath([base_path, file_path]) != base_path:
+            raise ValueError("Invalid file path")
+
+        if os.path.isfile(file_path):
+            # Delete only the file itself, never a parent directory tree
+            os.remove(file_path)
+            # Remove the containing directory if it is a subdirectory of the
+            # upload folder and is now empty
+            directory = os.path.dirname(file_path)
+            if (
+                directory != base_path
+                and os.path.isdir(directory)
+                and not os.listdir(directory)
+            ):
+                os.rmdir(directory)
             return True
         return False
 
